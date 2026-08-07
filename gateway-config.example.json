@@ -1,0 +1,25 @@
+{
+  "children": [
+    {
+      "name": "github",
+      "transport": "stdio",
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-github"],
+      "env": { "GITHUB_TOKEN": "${GITHUB_TOKEN}" }
+    },
+    {
+      "name": "local-thing",
+      "transport": "stdio",
+      "command": "node",
+      "args": ["${HOME}/my-mcp-servers/thing/index.mjs"],
+      "autoMount": false
+    },
+    {
+      "name": "remote",
+      "transport": "http",
+      "url": "http://127.0.0.1:9000/mcp",
+      "headers": { "Authorization": "Bearer ${REMOTE_TOKEN}" },
+      "autoMount": false
+    }
+  ]
+}

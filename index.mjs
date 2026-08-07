@@ -20,8 +20,12 @@
  * Child transports supported: stdio ({command,args,env}) and http ({url,headers}).
  */
 
+// The low-level Server is marked deprecated in favour of McpServer, but McpServer
+// registers tools declaratively — this gateway's tool list changes at runtime and
+// it forwards raw CallTool requests to children, so the raw request handlers are
+// the right primitive here. Do not "modernise" this to McpServer.
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
-import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
@@ -29,7 +33,10 @@ import { SSEClientTransport } from "@modelcontextprotocol/sdk/client/sse.js";
 import {
   ListToolsRequestSchema,
   CallToolRequestSchema,
+  isInitializeRequest,
 } from "@modelcontextprotocol/sdk/types.js";
+import { createServer } from "http";
+import { randomUUID, timingSafeEqual } from "crypto";
 import { readFileSync, writeFileSync, existsSync, mkdirSync } from "fs";
 import { dirname, join } from "path";
 import { fileURLToPath } from "url";
@@ -41,18 +48,42 @@ const CONFIG_PATH = process.env.MCP_GATEWAY_CONFIG || join(__dirname, "gateway-c
 // Disabled unless MCP_GATEWAY_REGISTRY is set to a writable path.
 const REGISTRY_PATH = process.env.MCP_GATEWAY_REGISTRY || null;
 const SEP = "__"; // namespace separator: <child>__<tool>
+// One trace line per proxied call. Proxying is the only thing this process does
+// at runtime, so without it a slow or wedged child is indistinguishable from
+// silence. Set GATEWAY_LOG_CALLS=0 to mute.
+const LOG_CALLS = process.env.GATEWAY_LOG_CALLS !== "0";
 
 const log = (...a) => console.error("[mcp-gateway]", ...a);
 
 // ---- persistence ----
+// Expand ${VAR} references against process.env so secrets (OAuth client info,
+// bearer tokens) live in the gitignored .env, not in the tracked config file.
+// Unset vars expand to "" with a warning.
+function expandEnv(v) {
+  if (typeof v === "string") {
+    return v.replace(/\$\{([A-Z0-9_]+)\}/g, (_, name) => {
+      if (process.env[name] === undefined) log(`config: env var ${name} is not set`);
+      return process.env[name] ?? "";
+    });
+  }
+  if (Array.isArray(v)) return v.map(expandEnv);
+  if (v && typeof v === "object") {
+    return Object.fromEntries(Object.entries(v).map(([k, val]) => [k, expandEnv(val)]));
+  }
+  return v;
+}
 function loadConfig() {
   if (!existsSync(CONFIG_PATH)) return { children: [] };
   try { return JSON.parse(readFileSync(CONFIG_PATH, "utf8")); }
   catch (e) { log("config parse error:", e.message); return { children: [] }; }
 }
-function saveConfig(children) {
-  const serializable = children.map(({ name, transport, command, args, env, url, headers }) =>
-    ({ name, transport, command, args, env, url, headers }));
+// Persist the CONFIGURED set (source of truth), not just what's mounted — so a
+// child parked with autoMount:false survives restarts instead of being pruned.
+// undefined keys (e.g. autoMount on eager children) are dropped by JSON.stringify.
+function persistConfig() {
+  const serializable = [...state.configured.values()].map(
+    ({ name, transport, command, args, env, url, headers, autoMount }) =>
+      ({ name, transport, command, args, env, url, headers, autoMount }));
   writeFileSync(CONFIG_PATH, JSON.stringify({ children: serializable }, null, 2) + "\n");
 }
 function writeRegistry(state) {
@@ -69,9 +100,35 @@ function writeRegistry(state) {
 
 // ---- runtime state ----
 const state = {
-  children: new Map(),       // name -> { cfg, client, tools:[{name,description,inputSchema}], error }
+  configured: new Map(),     // name -> raw cfg (persisted source of truth, may carry autoMount:false)
+  children: new Map(),       // name -> { cfg, client, tools:[{name,description,inputSchema}], error } — currently MOUNTED
   toolIndex: new Map(),      // prefixedName -> { child, original }
+  stats: new Map(),          // name -> call counters; keyed by child NAME, not by the
+                             // mounted object, so park/remount doesn't reset the history.
 };
+
+// ---- call metrics ----
+// Deliberately records the tool NAME and outcome only. Arguments are never
+// logged or retained: children receive bearer tokens, mail bodies and file
+// paths, and this log is a plain file read by the dashboard.
+function statsFor(child) {
+  let s = state.stats.get(child);
+  if (!s) {
+    s = { calls: 0, errors: 0, lastTool: null, lastMs: null, lastAt: null, lastError: null };
+    state.stats.set(child, s);
+  }
+  return s;
+}
+
+function recordCall(child, tool, ms, error) {
+  const s = statsFor(child);
+  s.calls++;
+  s.lastTool = tool;
+  s.lastMs = ms;
+  s.lastAt = new Date().toISOString();
+  if (error) { s.errors++; s.lastError = error; }
+  if (LOG_CALLS) log(`${child}.${tool} ${error ? `err — ${error}` : "ok"} ${ms}ms`);
+}
 
 function rebuildToolIndex() {
   state.toolIndex.clear();
@@ -82,7 +139,10 @@ function rebuildToolIndex() {
   }
 }
 
-function makeTransport(cfg) {
+function makeTransport(rawCfg) {
+  // Expand ${VAR} at spawn time only, so the persisted cfg keeps placeholders
+  // and saveConfig never writes resolved secrets back to disk.
+  const cfg = expandEnv(rawCfg);
   if (cfg.transport === "stdio") {
     return new StdioClientTransport({
       command: cfg.command,
@@ -120,6 +180,8 @@ async function mountChild(cfg) {
   }
   const c = await connectChild(cfg);
   state.children.set(cfg.name, c);
+  // Remember it as configured so it persists; mounting never prunes the parked set.
+  if (!state.configured.has(cfg.name)) state.configured.set(cfg.name, cfg);
   rebuildToolIndex();
   return c;
 }
@@ -133,24 +195,30 @@ async function unmountChild(name) {
   return true;
 }
 
-// ---- build the gateway server ----
-const server = new Server(
-  { name: "gateway", version: "1.0.0" },
-  { capabilities: { tools: { listChanged: true } } },
-);
+// ---- build the gateway server(s) ----
+// One lightweight Server facade per connected client, all sharing the singleton
+// child pool (state.children). N Claude sessions => ONE set of child subprocesses.
+const facades = new Set();
+
+async function broadcastToolListChanged() {
+  for (const s of facades) {
+    try { await s.sendToolListChanged(); } catch { /* client gone */ }
+  }
+}
 
 const META_TOOLS = [
   {
     name: "gateway_list",
-    description: "List child MCP servers mounted in the gateway and the tools each exposes.",
+    description: "List configured child MCP servers (mounted AND parked) and the tools each exposes. Parked children (mounted:false) can be brought online with gateway_mount({name}).",
     inputSchema: { type: "object", properties: {} },
   },
   {
     name: "gateway_mount",
     description:
-      "Mount a child MCP server at runtime and expose its tools (namespaced <name>__<tool>). " +
-      "stdio: pass transport='stdio', command, args[], env{}. http/sse: pass transport, url, headers{}. " +
-      "The new tools appear immediately via tools/list_changed — no session restart needed.",
+      "Mount a child MCP server and expose its tools (namespaced <name>__<tool>). " +
+      "To bring a PARKED child online, pass just its {name} — its stored config is reused. " +
+      "To register a NEW child, also pass connection details: stdio → transport='stdio', command, args[], env{}; http/sse → transport, url, headers{}. " +
+      "Tools appear immediately via tools/list_changed — no session restart needed.",
     inputSchema: {
       type: "object",
       properties: {
@@ -167,10 +235,10 @@ const META_TOOLS = [
   },
   {
     name: "gateway_unmount",
-    description: "Unmount a child MCP server and remove its tools (emits tools/list_changed).",
+    description: "Stop a child MCP server and remove its tools (emits tools/list_changed). By default the child is PARKED (kept in config, autoMount:false) so it can be remounted by name. Pass forget:true to remove it from config entirely.",
     inputSchema: {
       type: "object",
-      properties: { name: { type: "string" } },
+      properties: { name: { type: "string" }, forget: { type: "boolean", description: "Remove from config instead of parking", default: false } },
       required: ["name"],
     },
   },
@@ -190,33 +258,55 @@ function allTools() {
   return out;
 }
 
-server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: allTools() }));
+const handleListTools = async () => ({ tools: allTools() });
 
-server.setRequestHandler(CallToolRequestSchema, async (req) => {
+const handleCallTool = async (req) => {
   const { name, arguments: args = {} } = req.params;
 
   // ---- meta tools ----
   if (name === "gateway_list") {
-    const children = [...state.children.entries()].map(([n, c]) => ({
-      name: n, transport: c.cfg.transport, error: c.error || null,
-      tools: c.tools.map((t) => t.name),
-    }));
+    // Report every configured child, whether mounted or parked, so the caller
+    // knows what it can bring online with gateway_mount({name}).
+    const children = [...state.configured.entries()].map(([n, cfg]) => {
+      const c = state.children.get(n);
+      const s = state.stats.get(n);
+      return {
+        name: n,
+        transport: cfg.transport,
+        mounted: !!c,
+        autoMount: cfg.autoMount !== false,
+        error: c ? (c.error || null) : null,
+        tools: c ? c.tools.map((t) => t.name) : [],
+        // Survives park/remount, resets only when the gateway itself restarts.
+        ...(s ? { stats: s } : {}),
+      };
+    });
     return { content: [{ type: "text", text: JSON.stringify({ children }, null, 2) }] };
   }
 
   if (name === "gateway_mount") {
     try {
-      const cfg = {
-        name: args.name,
-        transport: args.transport || "stdio",
-        command: args.command, args: args.args, env: args.env,
-        url: args.url, headers: args.headers,
-      };
-      if (!cfg.name) throw new Error("name is required");
+      if (!args.name) throw new Error("name is required");
+      // Bare {name} → mount a child already configured (e.g. one parked with
+      // autoMount:false). Full args → register/replace a child, active by default.
+      const hasConn = args.transport || args.command || args.url;
+      let cfg;
+      if (!hasConn && state.configured.has(args.name)) {
+        cfg = { ...state.configured.get(args.name) };
+      } else {
+        cfg = {
+          name: args.name,
+          transport: args.transport || "stdio",
+          command: args.command, args: args.args, env: args.env,
+          url: args.url, headers: args.headers,
+        };
+        state.configured.set(cfg.name, cfg); // new/updated child persists as eager
+      }
       const c = await mountChild(cfg);
-      saveConfig([...state.children.values()].map((x) => x.cfg));
+      persistConfig();
       writeRegistry(state);
-      await server.sendToolListChanged();
+      await broadcastToolListChanged();
+      log(`mounted ${cfg.name} (${cfg.transport}) on demand — ${c.tools.length} tools`);
       return { content: [{ type: "text", text: JSON.stringify({ mounted: cfg.name, tools: c.tools.map((t) => `${cfg.name}${SEP}${t.name}`) }, null, 2) }] };
     } catch (e) {
       return { content: [{ type: "text", text: `Error mounting: ${e.message}` }], isError: true };
@@ -226,10 +316,22 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
   if (name === "gateway_unmount") {
     try {
       const ok = await unmountChild(args.name);
-      saveConfig([...state.children.values()].map((x) => x.cfg));
+      // Default: park it (stays configured, autoMount:false) so it's mountable
+      // again by name. forget:true fully removes it from the configured set.
+      let parked = false;
+      if (state.configured.has(args.name)) {
+        if (args.forget) {
+          state.configured.delete(args.name);
+        } else {
+          state.configured.set(args.name, { ...state.configured.get(args.name), autoMount: false });
+          parked = true;
+        }
+      }
+      persistConfig();
       writeRegistry(state);
-      await server.sendToolListChanged();
-      return { content: [{ type: "text", text: JSON.stringify({ unmounted: ok ? args.name : null, found: ok }, null, 2) }] };
+      await broadcastToolListChanged();
+      if (ok) log(`unmounted ${args.name}${parked ? " (parked)" : " (forgotten)"}`);
+      return { content: [{ type: "text", text: JSON.stringify({ unmounted: ok ? args.name : null, found: ok, parked }, null, 2) }] };
     } catch (e) {
       return { content: [{ type: "text", text: `Error unmounting: ${e.message}` }], isError: true };
     }
@@ -244,17 +346,130 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
   if (!child) {
     return { content: [{ type: "text", text: `Child ${entry.child} not mounted` }], isError: true };
   }
+  const t0 = Date.now();
   try {
     const result = await child.client.callTool({ name: entry.original, arguments: args });
+    // A child reports a *tool-level* failure as isError on an otherwise
+    // successful response — count it, or the error rate reads as zero while
+    // every call is failing.
+    const failed = result?.isError === true;
+    recordCall(entry.child, entry.original, Date.now() - t0, failed ? "tool reported isError" : null);
     return result;
   } catch (e) {
+    recordCall(entry.child, entry.original, Date.now() - t0, e.message);
     return { content: [{ type: "text", text: `Proxy error (${entry.child}.${entry.original}): ${e.message}` }], isError: true };
   }
-});
+};
+
+// A fresh facade per connected client; all facades share the singleton state.
+function buildFacade() {
+  const server = new Server(
+    { name: "gateway", version: "1.0.0" },
+    { capabilities: { tools: { listChanged: true } } },
+  );
+  server.setRequestHandler(ListToolsRequestSchema, handleListTools);
+  server.setRequestHandler(CallToolRequestSchema, handleCallTool);
+  facades.add(server);
+  return server;
+}
+
+// ---- HTTP daemon (Streamable HTTP, stateful per-session) ----
+function readBody(req) {
+  return new Promise((resolve) => {
+    let data = "";
+    req.on("data", (c) => { data += c; });
+    req.on("end", () => { try { resolve(data ? JSON.parse(data) : undefined); } catch { resolve(undefined); } });
+    req.on("error", () => resolve(undefined));
+  });
+}
+
+function startHttpDaemon(port) {
+  const TOKEN = process.env.GATEWAY_HTTP_TOKEN || null; // optional bearer; the 127.0.0.1 bind + Host/Origin guard are the primary boundary
+  const expectedAuth = TOKEN ? `Bearer ${TOKEN}` : null;
+  const bearerOk = (got) => {
+    if (!expectedAuth) return true;
+    const a = Buffer.from(String(got || "")), b = Buffer.from(expectedAuth);
+    return a.length === b.length && timingSafeEqual(a, b); // constant-time, length-safe
+  };
+  const sessions = new Map(); // sessionId -> { transport, server }
+
+  const hostOk = new RegExp(`^(127\\.0\\.0\\.1|localhost|\\[::1\\]):${port}$`);
+
+  const httpServer = createServer(async (req, res) => {
+    const path = (req.url || "").split("?")[0];
+    if (path !== "/mcp") { res.writeHead(404).end(); return; }
+    // DNS-rebinding / CSRF guard. We bind to 127.0.0.1, but a browser on this
+    // machine can still reach us — so a visited page must not be able to POST MCP
+    // commands here (CSRF) or read them back via a rebound DNS name. Pin Host to
+    // localhost and reject any browser-originated request: browsers always attach
+    // Origin/Referer/Sec-Fetch-Site on a cross-origin request, while node MCP
+    // clients (the only legitimate callers) attach none of them.
+    if (!hostOk.test(String(req.headers.host || ""))) {
+      res.writeHead(421, { "content-type": "application/json" })
+         .end(JSON.stringify({ error: "bad host (DNS-rebinding guard)" }));
+      return;
+    }
+    if (req.headers.origin || req.headers.referer || req.headers["sec-fetch-site"]) {
+      res.writeHead(403, { "content-type": "application/json" })
+         .end(JSON.stringify({ error: "forbidden: browser-originated request" }));
+      return;
+    }
+    if (TOKEN && !bearerOk(req.headers["authorization"])) { res.writeHead(401).end(); return; }
+    try {
+      if (req.method === "POST") {
+        const body = await readBody(req);
+        const sid = req.headers["mcp-session-id"];
+        const entry = sid ? sessions.get(sid) : null;
+        if (!entry && isInitializeRequest(body)) {
+          const server = buildFacade();
+          const transport = new StreamableHTTPServerTransport({
+            sessionIdGenerator: () => randomUUID(),
+            onsessioninitialized: (id) => { sessions.set(id, { transport, server }); },
+          });
+          transport.onclose = () => {
+            if (transport.sessionId) sessions.delete(transport.sessionId);
+            facades.delete(server);
+          };
+          await server.connect(transport);
+          await transport.handleRequest(req, res, body);
+          return;
+        }
+        if (!entry) {
+          res.writeHead(400, { "content-type": "application/json" })
+             .end(JSON.stringify({ jsonrpc: "2.0", error: { code: -32000, message: "No valid session" }, id: null }));
+          return;
+        }
+        await entry.transport.handleRequest(req, res, body);
+        return;
+      }
+      if (req.method === "GET" || req.method === "DELETE") {
+        const sid = req.headers["mcp-session-id"];
+        const entry = sid ? sessions.get(sid) : null;
+        if (!entry) { res.writeHead(400).end("No valid session"); return; }
+        await entry.transport.handleRequest(req, res);
+        return;
+      }
+      res.writeHead(405).end();
+    } catch (e) {
+      log("http handler error:", e.message);
+      if (!res.headersSent) res.writeHead(500).end();
+    }
+  });
+
+  httpServer.listen(port, "127.0.0.1", () => {
+    log(`ready (http) — 127.0.0.1:${port}/mcp — ${state.children.size} children, ${state.toolIndex.size} proxied tools + 3 meta`);
+  });
+}
 
 // ---- boot ----
 const cfg = loadConfig();
 for (const childCfg of cfg.children || []) {
+  // Register every child as configured; only auto-mount those not parked.
+  state.configured.set(childCfg.name, childCfg);
+  if (childCfg.autoMount === false) {
+    log(`parked ${childCfg.name} (${childCfg.transport}) — mount on demand with gateway_mount`);
+    continue;
+  }
   try {
     await mountChild(childCfg);
     log(`mounted ${childCfg.name} (${childCfg.transport}) — ${state.children.get(childCfg.name).tools.length} tools`);
@@ -266,5 +481,5 @@ for (const childCfg of cfg.children || []) {
 rebuildToolIndex();
 writeRegistry(state);
 
-await server.connect(new StdioServerTransport());
-log(`ready — ${state.children.size} children, ${state.toolIndex.size} proxied tools + 3 meta`);
+const HTTP_PORT = Number(process.env.GATEWAY_HTTP_PORT) || 23371;
+startHttpDaemon(HTTP_PORT);

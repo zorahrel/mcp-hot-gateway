@@ -1,7 +1,7 @@
 {
   "name": "mcp-hot-gateway",
-  "version": "1.0.0",
-  "description": "An MCP server that mounts and unmounts other MCP servers at runtime — the agent calls mount/unmount itself, child tools appear instantly via tools/list_changed, no session restart, no config edit.",
+  "version": "2.0.0",
+  "description": "An MCP server that mounts and unmounts other MCP servers at runtime \u2014 the agent calls mount/unmount itself, child tools appear instantly via tools/list_changed, no session restart. Runs as a shared HTTP daemon so N client sessions share ONE pool of child processes.",
   "type": "module",
   "bin": {
     "mcp-hot-gateway": "index.mjs"
@@ -9,11 +9,13 @@
   "main": "index.mjs",
   "files": [
     "index.mjs",
+    "gateway-config.example.json",
     "README.md",
     "LICENSE"
   ],
   "scripts": {
-    "start": "node index.mjs"
+    "start": "node index.mjs",
+    "test": "node test/smoke.mjs"
   },
   "keywords": [
     "mcp",
@@ -29,7 +31,11 @@
     "anthropic",
     "llm",
     "agent",
-    "tools"
+    "tools",
+    "daemon",
+    "http",
+    "shared",
+    "observability"
   ],
   "engines": {
     "node": ">=18"
