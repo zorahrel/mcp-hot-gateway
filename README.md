@@ -193,6 +193,16 @@ Boots a real gateway against a real child over HTTP and asserts the paths that
 actually break: proxying, both failure shapes, the call metrics, the
 park/remount cycle, and config persistence. Exits non-zero on the first failure.
 
+## Where this gets used
+
+- **[claude-harness](https://github.com/zorahrel/claude-harness)** — skills,
+  commands and tools for Claude Code that survive long autonomous runs. Several
+  of them assume the MCP servers this gateway mounts.
+- **[jarvis-claudecode](https://github.com/zorahrel/jarvis-claudecode)** — the
+  multi-channel router that brings the Claude Code CLI to Telegram, WhatsApp and
+  Discord. It runs this gateway as its single MCP entry point, with 18 children
+  configured and most of them parked until needed.
+
 ## License
 
 MIT © Attilio Cianci
