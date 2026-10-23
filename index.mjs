@@ -114,7 +114,7 @@ const state = {
 function statsFor(child) {
   let s = state.stats.get(child);
   if (!s) {
-    s = { calls: 0, errors: 0, lastTool: null, lastMs: null, lastAt: null, lastError: null };
+    s = { calls: 0, errors: 0, inFlight: 0, lastTool: null, lastMs: null, lastAt: null, lastError: null };
     state.stats.set(child, s);
   }
   return s;
@@ -169,6 +169,7 @@ async function connectChild(cfg) {
   return {
     cfg,
     client,
+    transport,
     tools: tools.map((t) => ({ name: t.name, description: t.description, inputSchema: t.inputSchema })),
     error: null,
   };
@@ -277,6 +278,8 @@ const handleCallTool = async (req) => {
         autoMount: cfg.autoMount !== false,
         error: c ? (c.error || null) : null,
         tools: c ? c.tools.map((t) => t.name) : [],
+        // pid del processo figlio (solo stdio): serve a misurarne la memoria da fuori
+        ...(c && c.transport && c.transport.pid ? { pid: c.transport.pid } : {}),
         // Survives park/remount, resets only when the gateway itself restarts.
         ...(s ? { stats: s } : {}),
       };
@@ -347,6 +350,9 @@ const handleCallTool = async (req) => {
     return { content: [{ type: "text", text: `Child ${entry.child} not mounted` }], isError: true };
   }
   const t0 = Date.now();
+  // inFlight: chi rimonta un figlio da fuori (il freno del Mac nell'usage-hub) non deve tagliare una chiamata a metà
+  const st = statsFor(entry.child);
+  st.inFlight++;
   try {
     const result = await child.client.callTool({ name: entry.original, arguments: args });
     // A child reports a *tool-level* failure as isError on an otherwise
@@ -358,6 +364,8 @@ const handleCallTool = async (req) => {
   } catch (e) {
     recordCall(entry.child, entry.original, Date.now() - t0, e.message);
     return { content: [{ type: "text", text: `Proxy error (${entry.child}.${entry.original}): ${e.message}` }], isError: true };
+  } finally {
+    st.inFlight = Math.max(0, st.inFlight - 1);
   }
 };
 

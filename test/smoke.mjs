@@ -102,6 +102,8 @@ console.log("\ncall metrics");
   ok(typeof s?.lastMs === "number" && s.lastMs >= 0, "records call duration", `lastMs=${s?.lastMs}`);
   ok(s?.lastTool === "hard_fail", "records the last tool called", `lastTool=${s?.lastTool}`);
   ok(!!s?.lastAt, "records when the last call happened");
+  ok(s?.inFlight === 0, "no call in flight once every call returned", `inFlight=${s?.inFlight}`);
+  ok(Number.isInteger(childNamed(list, "fake")?.pid), "gateway_list reports the stdio child's pid");
 
   ok(/fake\.echo ok \d+ms/.test(stderrBuf), "logs one trace line per call, with the tool name",
      stderrBuf.split("\n").filter((l) => l.includes("fake.")).join(" | "));
